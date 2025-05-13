@@ -2,6 +2,10 @@
 
 For the project to work properly, you need to open the `.env` file (you can use Notepad or Notepad++) and enter your username and your active key.
 
+The program will check if there is a payment for any post on yesterday's date (Today -1) or today's date.
+
+The HBD value of each post will only be deposited once into savings, as in this process it is possible to configure a memo. This memo will be the key to prevent the HBD value of this post from being deposited in the savings account more than once every time the file checks for a post.
+
 ---
 ### ⚠️ WARNING
 **Be very careful when handling your active key!**
