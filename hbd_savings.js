@@ -137,6 +137,7 @@ async function sendToSavings(amount, permlink) {
         log(`Sent ${amount.toFixed(3)} HBD to savings with memo "${memo}".`);
 
     } catch (err) {
+        //v25.5.2 16/05/2025
         log("Error sending to savings: " + err.message);
     }
 }
