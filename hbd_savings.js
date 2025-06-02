@@ -9,30 +9,6 @@ const client = new dhive.Client(['https://api.hive.blog']);
 const username = process.env.HIVE_USERNAME;
 const activeKey = dhive.PrivateKey.fromString(process.env.HIVE_ACTIVE_KEY);
 
-function isHiveYesterday(timestamp) {
-    const rewardDate = new Date(timestamp + 'Z'); //Hive timestamp is now in UTC
-    const now = new Date();
-    const yesterday = new Date(Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate() - 1
-    ));
-
-    return rewardDate.toISOString().slice(0, 10) === yesterday.toISOString().slice(0, 10);
-}
-
-//Additional function to check if it is today (UTC)
-function isHiveToday(timestamp) {
-    const rewardDate = new Date(timestamp + 'Z');
-    const now = new Date();
-    const today = new Date(Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate()
-    ));
-    return rewardDate.toISOString().slice(0, 10) === today.toISOString().slice(0, 10);
-}
-
 function log(msg) {
   
     const now = new Date();
@@ -55,62 +31,101 @@ function log(msg) {
     console.log(fullMsg.trim());
 }
 
+function getUTCDateString(daysAgo = 0) {
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - daysAgo);
+    return date.toISOString().split('T')[0]; // retorna YYYY-MM-DD
+}
 
 ////possible improvement => check if there is a pending claim reward and do it first
-async function getLastPostReward(author) {
+async function getLastPostReward(hiveUser) {
+    let start = -1;
+    let processedOps = 0;
+    const limiteMax = 10000;
+    const todayUTC = getUTCDateString(0);
+    const yesterdayUTC = getUTCDateString(1);
+    const done =false
 
-    const history = await client.database.call('get_account_history', [author, -1, 1000]);
+    while (processedOps < limiteMax) {
 
-    //Internal function to fetch post reward by date
-    async function findRewardByDate(dateCheckFn) {
+        const batchSize = 1000;
 
-        for (const [_, op] of history.slice().reverse()) {
+        const history = await client.database.call('get_account_history', [hiveUser, start, batchSize]);
 
-            if (op.op[0] !== 'author_reward') continue;
-            if (op.op[1].author !== author) continue;
+        if (!history || history.length === 0) break;
 
-            const permlink = op.op[1].permlink;
-            const content = await client.database.call('get_content', [author, permlink]);
+        for (const [index, entry] of history.slice().reverse()) {
 
-            if (content.parent_author !== "") continue; //Ignore comments
-            if (!dateCheckFn(op.timestamp)) continue; //Check the date
+            const [opType, opData] = entry.op;
+            const timestamp = entry.timestamp.split('T')[0];
+            
+            start = index - 1;
+            processedOps++;
 
-            const amount = parseFloat(op.op[1].hbd_payout.replace(' HBD', ''));
+            if (timestamp < yesterdayUTC) {
+                log(`Verification date (${timestamp}) less than yesterday's (${yesterdayUTC}). No postback found!`);
+                done = true;
+                break;
+            }
+
+            if (timestamp !== todayUTC && timestamp !== yesterdayUTC) continue;
+            if (opType !== 'author_reward') continue;
+            if (opData.author !== hiveUser) continue;
+
+            const permlink = opData.permlink;
+
+            const content = await client.database.call('get_content', [hiveUser, permlink]);
+
+            if (content.parent_author !== "") continue;
+
+            log(`Checking if already processed for ${permlink}`);
+
+            if (await wasAlreadyProcessed(permlink)) {
+                log(`Post "${permlink}" already had HBD sent to savings!`);
+                continue;
+            }
+
+            const amount = parseFloat(opData.hbd_payout.replace(' HBD', ''));
 
             return { amount, permlink };
         }
-
-        return null;
-
     }
 
-    // First, try to find yesterday's reward
-    log("Checking if there post payment on yesterday's date...")
+    log("No post rewards found for yesterday or today (UTC).");
 
-    const rewardYesterday = await findRewardByDate(isHiveYesterday);
-    if (rewardYesterday) return rewardYesterday;
-
-    // If not found, try to find today's reward
-    log("Checking if there post payment on today's date...")
-
-    const rewardToday = await findRewardByDate(isHiveToday);
-
-    if (rewardToday) return rewardToday;
- 
-    log("No post rewards found!")
-
-    return null
+    return null;
 }
 
 async function wasAlreadyProcessed(permlink) {
-    const history = await client.database.call('get_account_history', [username, -1, 1000]);
     const memoTag = `auto-save:${permlink}`;
+    let start = -1;
+    const batchSize = 1000;
+    const limiteMax = 10000; // safety limit to not seek infinity
+    let totalChecked = 0;
 
-    return history.some(([_, op]) =>
-        op.op[0] === 'transfer_to_savings' &&
-        op.op[1].from === username &&
-        op.op[1].memo === memoTag
-    );
+    while (totalChecked < limiteMax) {
+
+        const history = await client.database.call('get_account_history', [username, start, batchSize]);
+
+        if (!history || history.length === 0) break;
+
+        for (const [index, entry] of history) {
+            start = index - 1;
+            totalChecked++;
+
+            const [opType, opData] = entry.op;
+
+            if (
+                opType === 'transfer_to_savings' &&
+                opData.from === username &&
+                opData.memo === memoTag
+            ) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 async function sendToSavings(amount, permlink) {
@@ -156,6 +171,8 @@ async function main() {
         process.exit(1);
     }
 
+    log(`Configuration parameters OK!`);
+
     //get the information from the last post
     const postInfo = await getLastPostReward(username);
 
@@ -166,12 +183,6 @@ async function main() {
     //the postInfo variable will contain the return of getLastPostReward() with the value and permlink of the post
     const { amount, permlink } = postInfo;
 
-    //validating whether any operation has already been performed on the returned post
-    if (await wasAlreadyProcessed(permlink)) {
-        log(`Post "${permlink}" already had HBD sent to savings!`);
-        return;
-    }
-
     //0 = fixed, 1 = percentage
     const usePercent = process.env.HBD_SEND_MODE === '1';
 
@@ -180,7 +191,7 @@ async function main() {
         const percent = parseFloat(process.env.HBD_PERCENT_VALUE);
 
         if (percent <= 0) {
-            log('HBD_PERCENT_VALUE field cannot be zero or negative.');
+            log('HBD_PERCENT_VALUE field cannot be zero or negative! Cannot continue!');
             process.exit(1);
         }
     
@@ -197,7 +208,7 @@ async function main() {
         hbdFixValue = parseFloat(process.env.HBD_FIX_VALUE);
 
         if (hbdFixValue <= 0) {
-            log('HBD_FIX_VALUE field cannot be zero or negative.');
+            log('HBD_FIX_VALUE field cannot be zero or negative! Cannot continue!');
             process.exit(1);
         }
     
